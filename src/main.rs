@@ -1,4 +1,3 @@
-
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,7 +44,7 @@ struct ClientState {
     world_id: WorldId,
 }
 
-const MAX_PLAYERS: usize = 10;
+const MAX_PLAYERS: usize = 1000;
 const START_POS: BlockPos = BlockPos::new(0, 100, 0);
 
 const BLOCK_TYPES: [BlockState; 7] = [
@@ -79,7 +78,7 @@ impl Config for Game {
             max_players: MAX_PLAYERS as i32,
             player_sample: Default::default(),
             description: "".into_text(),
-            favicon_png: None
+            favicon_png: None,
         }
     }
 
@@ -143,7 +142,6 @@ impl Config for Game {
                     );
                 }
 
-                client.send_message("Welcome to epic infinite parkour game!".italic());
                 client.set_game_mode(GameMode::Adventure);
                 reset(client, world);
             }
@@ -260,7 +258,7 @@ fn reset(client: &mut Client<Game>, world: &mut World<Game>) {
     for chunk_z in -1..3 {
         for chunk_x in -2..2 {
             world.chunks.insert(
-                (chunk_x as i32, chunk_z as i32),
+                (chunk_x, chunk_z),
                 UnloadedChunk::default(),
                 ChunkState { keep_loaded: true },
             );
