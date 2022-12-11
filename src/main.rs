@@ -67,6 +67,19 @@ impl Config for Game {
     type PlayerListState = ();
     type InventoryState = ();
 
+    fn connection_mode(&self) -> ConnectionMode {
+        let secret = std::env::var("VELOCITY_SECRET");
+        if let Ok(secret) = secret {
+            println!("Using velocity");
+            ConnectionMode::Velocity {
+                secret
+            }
+        } else {
+            println!("Using online mode (if you want to use velocity, set the VELOCITY_SECRET environment variable)");
+            ConnectionMode::Online
+        }
+    }
+
     async fn server_list_ping(
         &self,
         _server: &SharedServer<Self>,
