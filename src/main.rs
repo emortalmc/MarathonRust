@@ -144,6 +144,7 @@ impl Config for Game {
 
                 client.set_game_mode(GameMode::Adventure);
                 reset(client, world);
+                client.play_sound(Ident::new("minecraft:entity.player.levelup").unwrap(), SoundCategory::Master, client.position(), 1f32, 1f32);
             }
 
             let world_id = client.world_id;
