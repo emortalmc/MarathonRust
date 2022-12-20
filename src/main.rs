@@ -1,16 +1,22 @@
 use std::collections::VecDeque;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::seq::SliceRandom;
 use rand::Rng;
+use redis::{Commands, Connection, PubSubCommands};
 use valence::prelude::*;
 
 pub fn main() -> ShutdownResult {
     tracing_subscriber::fmt().init();
 
-    println!("Starting at localhost:25565!");
+    // redis();
+
+    let port = std::env::var("PORT").unwrap_or(String::from("25565"));
+    print!("Starting on 0.0.0.0:{}\n", port);
 
     valence::start_server(
         Game {
@@ -18,6 +24,36 @@ pub fn main() -> ShutdownResult {
         },
         ServerState { player_list: None },
     )
+}
+
+pub fn redis() {
+    let redis_address = std::env::var("REDIS_ADDRESS").unwrap();
+
+    let client = redis::Client::open(format!("redis://{}", redis_address)).expect("Connect to client");
+    let mut con = client.get_connection().expect("Get connection");
+
+    // redis listener thread
+    thread::spawn(move || {
+        let mut conn: Connection = client.get_connection()?;
+
+        conn.subscribe("proxyhello", |msg| {
+            let payload: String = msg.get_payload().unwrap();
+
+            match payload.as_ref() {
+                "10" => redis::ControlFlow::Break(()),
+                _ => {
+                    let mut connn = client.get_connection().unwrap();
+                    let _ : () = connn.publish("registergame", "marathonrust marathonrust 25572").expect("Failed to register game");
+
+                    println!("Received proxyhello, re-registered game!");
+
+                    redis::ControlFlow::Continue
+                }
+            }
+        })
+    });
+
+    let _ : () = con.publish("registergame", "marathonrust marathonrust 25572").expect("Failed to register game");
 }
 
 struct Game {
@@ -44,7 +80,7 @@ struct ClientState {
     world_id: WorldId,
 }
 
-const MAX_PLAYERS: usize = 1000;
+const MAX_PLAYERS: usize = 100;
 const START_POS: BlockPos = BlockPos::new(0, 100, 0);
 
 const BLOCK_TYPES: [BlockState; 7] = [
@@ -67,6 +103,10 @@ impl Config for Game {
     type PlayerListState = ();
     type InventoryState = ();
 
+    // fn compression_threshold(&self) -> Option<u32> {
+    //     None
+    // }
+
     fn connection_mode(&self) -> ConnectionMode {
         let secret = std::env::var("VELOCITY_SECRET");
         if let Ok(secret) = secret {
@@ -78,6 +118,11 @@ impl Config for Game {
             println!("Using online mode (if you want to use velocity, set the VELOCITY_SECRET environment variable)");
             ConnectionMode::Online
         }
+    }
+
+    fn address(&self) -> SocketAddr {
+        let port = std::env::var("PORT").unwrap_or(String::from("25565"));
+        SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), u16::from_str(&*port).unwrap()).into()
     }
 
     async fn server_list_ping(
@@ -258,6 +303,7 @@ impl Config for Game {
                 if let Some(id) = &server.state.player_list {
                     server.player_lists[id].remove(client.uuid());
                 }
+                server.worlds.get_mut(world_id).unwrap().set_deleted(true);
                 server.worlds.remove(world_id);
                 return false;
             }
@@ -272,7 +318,7 @@ fn reset(client: &mut Client<Game>, world: &mut World<Game>) {
     for chunk_z in -1..3 {
         for chunk_x in -2..2 {
             world.chunks.insert(
-                (chunk_x, chunk_z),
+                [chunk_x, chunk_z],
                 UnloadedChunk::default(),
                 ChunkState { keep_loaded: true },
             );

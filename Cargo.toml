@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-valence = { git = "https://github.com/valence-rs/valence", rev = "8b50e93b0e325ed1013ca350c38629944127891f" }
+valence = { git = "https://github.com/valence-rs/valence" }
 rand = "0.8.5"
 tracing-subscriber = "0.3.16"
-
+redis = "0.22.1"
