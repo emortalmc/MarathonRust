@@ -1,18 +1,14 @@
-mod game;
-mod parkourtag;
-
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::path::PathBuf;
 use std::str::FromStr;
-
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::seq::SliceRandom;
+use rand::Rng;
 use redis::{Commands, Connection, PubSubCommands};
 use valence::prelude::*;
-use valence_anvil::AnvilWorld;
-use crate::game::{Game, GameState};
-use crate::parkourtag::PTGame;
 
 pub fn main() -> ShutdownResult {
     tracing_subscriber::fmt().init();
@@ -23,18 +19,17 @@ pub fn main() -> ShutdownResult {
     print!("Starting on 0.0.0.0:{}\n", port);
 
     valence::start_server(
-        PTGameConfig {},
-        ServerState {
-            player_list: None,
-            // games: vec![],
-        })
+        Game {
+            player_count: AtomicUsize::new(0),
+        },
+        ServerState { player_list: None },
+    )
 }
 
 pub fn redis() {
     let redis_address = std::env::var("REDIS_ADDRESS").unwrap();
 
-    let client =
-        redis::Client::open(format!("redis://{}", redis_address)).expect("Connect to client");
+    let client = redis::Client::open(format!("redis://{}", redis_address)).expect("Connect to client");
     let mut con = client.get_connection().expect("Get connection");
 
     // redis listener thread
@@ -48,9 +43,7 @@ pub fn redis() {
                 "10" => redis::ControlFlow::Break(()),
                 _ => {
                     let mut connn = client.get_connection().unwrap();
-                    let _: () = connn
-                        .publish("registergame", "marathonrust marathonrust 25572")
-                        .expect("Failed to register game");
+                    let _ : () = connn.publish("registergame", "marathonrust marathonrust 25572").expect("Failed to register game");
 
                     println!("Received proxyhello, re-registered game!");
 
@@ -60,37 +53,53 @@ pub fn redis() {
         })
     });
 
-    let _: () = con
-        .publish("registergame", "marathonrust marathonrust 25572")
-        .expect("Failed to register game");
+    let _ : () = con.publish("registergame", "marathonrust marathonrust 25572").expect("Failed to register game");
 }
 
-pub struct PTGameConfig {}
+struct Game {
+    player_count: AtomicUsize,
+}
 
-pub struct ServerState {
+struct ServerState {
     player_list: Option<PlayerListId>,
 }
 
 #[derive(Default)]
-pub struct ClientState {
-    id: EntityId,
+struct ChunkState {
+    keep_loaded: bool,
 }
 
-pub struct WorldState {
-    anvil: AnvilWorld,
-    game_state: GameState,
-    game: Box<dyn Game<PTGameConfig>>
+#[derive(Default)]
+struct ClientState {
+    entity_id: EntityId,
+    blocks: VecDeque<BlockPos>,
+    score: u32,
+    combo: u32,
+    target_y: i32,
+    last_block_timestamp: u128,
+    world_id: WorldId,
 }
 
-const START_POS: BlockPos = BlockPos::new(0, 65, 0);
+const MAX_PLAYERS: usize = 100;
+const START_POS: BlockPos = BlockPos::new(0, 100, 0);
+
+const BLOCK_TYPES: [BlockState; 7] = [
+    BlockState::GRASS_BLOCK,
+    BlockState::OAK_LOG,
+    BlockState::BIRCH_LOG,
+    BlockState::OAK_LEAVES,
+    BlockState::BIRCH_LEAVES,
+    BlockState::DIRT,
+    BlockState::MOSS_BLOCK,
+];
 
 #[async_trait]
-impl Config for PTGameConfig {
+impl Config for Game {
     type ServerState = ServerState;
     type ClientState = ClientState;
     type EntityState = ();
-    type WorldState = WorldState;
-    type ChunkState = ();
+    type WorldState = ();
+    type ChunkState = ChunkState;
     type PlayerListState = ();
     type InventoryState = ();
 
@@ -98,20 +107,22 @@ impl Config for PTGameConfig {
     //     None
     // }
 
-    fn address(&self) -> SocketAddr {
-        let port = std::env::var("PORT").unwrap_or(String::from("25565"));
-        SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), u16::from_str(&*port).unwrap()).into()
-    }
-
     fn connection_mode(&self) -> ConnectionMode {
         let secret = std::env::var("VELOCITY_SECRET");
         if let Ok(secret) = secret {
             println!("Using velocity");
-            ConnectionMode::Velocity { secret }
+            ConnectionMode::Velocity {
+                secret
+            }
         } else {
             println!("Using online mode (if you want to use velocity, set the VELOCITY_SECRET environment variable)");
             ConnectionMode::Online
         }
+    }
+
+    fn address(&self) -> SocketAddr {
+        let port = std::env::var("PORT").unwrap_or(String::from("25565"));
+        SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), u16::from_str(&*port).unwrap()).into()
     }
 
     async fn server_list_ping(
@@ -121,8 +132,8 @@ impl Config for PTGameConfig {
         _protocol_version: i32,
     ) -> ServerListPing {
         ServerListPing::Respond {
-            online_players: 0,
-            max_players: 0,
+            online_players: self.player_count.load(Ordering::SeqCst) as i32,
+            max_players: MAX_PLAYERS as i32,
             player_sample: Default::default(),
             description: "".into_text(),
             favicon_png: None,
@@ -130,53 +141,56 @@ impl Config for PTGameConfig {
     }
 
     fn init(&self, server: &mut Server<Self>) {
-
+        server.state.player_list = Some(server.player_lists.insert(()).0);
     }
 
     fn update(&self, server: &mut Server<Self>) {
-        server.clients.retain(|client_id, client| {
+        server.clients.retain(|_, client| {
             if client.created_this_tick() {
+                if self
+                    .player_count
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                        (count < MAX_PLAYERS).then_some(count + 1)
+                    })
+                    .is_err()
+                {
+                    client.disconnect("The server is full!".color(Color::RED));
+                    return false;
+                }
+
+                let (world_id, world) = server.worlds.insert(DimensionId::default(), ());
+
                 match server
                     .entities
                     .insert_with_uuid(EntityKind::Player, client.uuid(), ())
                 {
-                    Some((id, _)) => client.state.id = id,
+                    Some((id, entity)) => {
+                        entity.set_world(world_id);
+
+                        // create client state
+                        client.state = ClientState {
+                            entity_id: id,
+                            blocks: VecDeque::new(),
+                            score: 0,
+                            combo: 0,
+                            last_block_timestamp: 0,
+                            target_y: 0,
+                            world_id,
+                        };
+                    }
                     None => {
                         client.disconnect("Conflicting UUID");
+                        server.worlds.remove(world_id);
                         return false;
                     }
                 }
 
-                let found_game = find_available_game(&server.worlds);
-                let (new_id, new_world) = match found_game {
-                    Some((id, mut world)) => {
-
-                        if let GameState::Lobby { countdown, waiting_players, .. } = world.state.game_state {
-                            waiting_players.push(client_id);
-                        }
-                        (id, world)
-                    }
-                    None => {
-                        create_pt_game(&mut server.worlds)
-                    }
-                };
-
-                client.respawn(new_id);
+                client.respawn(world_id);
                 client.set_flat(true);
-                client.set_game_mode(GameMode::Adventure);
-                client.teleport(
-                    [
-                        START_POS.x as f64 + 0.5,
-                        START_POS.y as f64,
-                        START_POS.z as f64 + 0.5,
-                    ],
-                    0.0,
-                    0.0,
-                );
                 client.set_player_list(server.state.player_list.clone());
 
                 if let Some(id) = &server.state.player_list {
-                    server.player_lists.get_mut(id).insert(
+                    server.player_lists[id].insert(
                         client.uuid(),
                         client.username(),
                         client.textures().cloned(),
@@ -185,23 +199,113 @@ impl Config for PTGameConfig {
                         None,
                     );
                 }
+
+                client.set_game_mode(GameMode::Adventure);
+                reset(client, world);
+                client.play_sound(Ident::new("minecraft:entity.player.levelup").unwrap(), SoundCategory::Master, client.position(), 1f32, 1f32);
+            }
+
+            let world_id = client.world_id;
+            let world = &mut server.worlds[world_id];
+
+            let p = client.position();
+            for pos in ChunkPos::at(p.x, p.z).in_view(3) {
+                if let Some(chunk) = world.chunks.get_mut(pos) {
+                    chunk.keep_loaded = true;
+                } else {
+                    world.chunks.insert(
+                        pos,
+                        UnloadedChunk::default(),
+                        ChunkState { keep_loaded: true },
+                    );
+                }
+            }
+
+            if (client.position().y as i32) < START_POS.y - 32 {
+                client.send_message(
+                    "Your score was ".italic()
+                        + client
+                            .score
+                            .to_string()
+                            .color(Color::GOLD)
+                            .bold()
+                            .not_italic(),
+                );
+
+                reset(client, world);
+            }
+
+            let pos_under_player = BlockPos::new(
+                (client.position().x - 0.5).round() as i32,
+                client.position().y as i32 - 1,
+                (client.position().z - 0.5).round() as i32,
+            );
+
+            if let Some(index) = client
+                .blocks
+                .iter()
+                .position(|block| *block == pos_under_player)
+            {
+                if index > 0 {
+                    let power_result = 2.0f32.powf((client.combo as f32) / 45.0);
+                    let max_time_taken = (1000.0f32 * (index as f32) / power_result) as u128;
+
+                    let current_time_millis = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis();
+                    if current_time_millis - client.last_block_timestamp < max_time_taken {
+                        client.combo += index as u32
+                    } else {
+                        client.combo = 0
+                    }
+
+                    let pitch = 0.9 + ((client.combo as f32) - 1.0) * 0.05;
+
+                    for _ in 0..index {
+                        generate_next_block(client, world, true)
+                    }
+
+                    client.play_sound(
+                        Ident::new("minecraft:block.note_block.bass").unwrap(),
+                        SoundCategory::Master,
+                        client.position(),
+                        1f32,
+                        pitch,
+                    );
+                    client.set_title(
+                        "",
+                        client.score.to_string().color(Color::LIGHT_PURPLE).bold(),
+                        SetTitleAnimationTimes {
+                            fade_in: 0,
+                            stay: 7,
+                            fade_out: 4,
+                        },
+                    );
+                }
+            }
+
+            let player = server.entities.get_mut(client.entity_id).unwrap();
+
+            while let Some(event) = client.next_event() {
+                event.handle_default(client, player);
+            }
+
+            // Remove chunks outside the view distance of players.
+            for (_, chunk) in world.chunks.iter_mut() {
+                chunk.set_deleted(!chunk.keep_loaded);
+                chunk.keep_loaded = false;
             }
 
             if client.is_disconnected() {
+                self.player_count.fetch_sub(1, Ordering::SeqCst);
+                player.set_deleted(true);
                 if let Some(id) = &server.state.player_list {
-                    server.player_lists.get_mut(id).remove(client.uuid());
+                    server.player_lists[id].remove(client.uuid());
                 }
-                server.entities.delete(client.id);
-
+                server.worlds.get_mut(world_id).unwrap().set_deleted(true);
+                server.worlds.remove(world_id);
                 return false;
-            }
-
-            while let Some(event) = client.next_event() {
-                if let Some(entity) = server.entities.get_mut(client.id) {
-                    event.handle_default(client, entity);
-
-
-                }
             }
 
             true
@@ -209,60 +313,89 @@ impl Config for PTGameConfig {
     }
 }
 
-fn find_available_game(worlds: &Worlds<PTGameConfig>) -> Option<(WorldId, &World<PTGameConfig>)> {
-    for (id, world) in worlds.iter() {
-        let game_state = &world.state.game_state;
-        let game = &world.state.game;
-
-        // Find first game that is available
-        if let GameState::Lobby { countdown, waiting_players, .. } = game_state {
-            if waiting_players.len() < game.max_players() {
-                return Option::from((id, world));
-            }
+fn reset(client: &mut Client<Game>, world: &mut World<Game>) {
+    // Load chunks around spawn to avoid double void reset
+    for chunk_z in -1..3 {
+        for chunk_x in -2..2 {
+            world.chunks.insert(
+                [chunk_x, chunk_z],
+                UnloadedChunk::default(),
+                ChunkState { keep_loaded: true },
+            );
         }
     }
 
-    None
+    client.score = 0;
+    client.combo = 0;
+
+    for block in &client.blocks {
+        world.chunks.set_block_state(*block, BlockState::AIR);
+    }
+    client.blocks.clear();
+    client.blocks.push_back(START_POS);
+    world.chunks.set_block_state(START_POS, BlockState::STONE);
+
+    for _ in 0..10 {
+        generate_next_block(client, world, false)
+    }
+
+    client.teleport(
+        [
+            START_POS.x as f64 + 0.5,
+            START_POS.y as f64 + 1.0,
+            START_POS.z as f64 + 0.5,
+        ],
+        0f32,
+        0f32,
+    );
 }
 
-fn create_pt_game(worlds: &mut Worlds<PTGameConfig>) -> (WorldId, &World<PTGameConfig>) {
-    let (world_id, world) = worlds.insert(
-        DimensionId::default(),
-        WorldState {
-            anvil: AnvilWorld::new(PathBuf::from("./lobby")),
-            game_state: GameState::Lobby {
-                countdown: 20,
-                waiting_players: vec![],
-            },
-            game: Box::new(PTGame {}),
-        }
+fn generate_next_block(client: &mut Client<Game>, world: &mut World<Game>, in_game: bool) {
+    if in_game {
+        let removed_block = client.blocks.pop_front().unwrap();
+        world.chunks.set_block_state(removed_block, BlockState::AIR);
 
-    );
-
-    for pos in ChunkPos::at(0f64, 0f64).in_view(3) {
-        match world.state.anvil.read_chunk(pos.x, pos.z) {
-            Ok(Some(anvil_chunk)) => {
-                let mut chunk = UnloadedChunk::new(24);
-
-                if let Err(e) =
-                    valence_anvil::to_valence(&anvil_chunk.data, &mut chunk, 4, |_| {
-                        BiomeId::default()
-                    })
-                {
-                    eprintln!("Failed to convert chunk at ({}, {}): {e}", pos.x, pos.z);
-                }
-
-                world.chunks.insert(pos, chunk, ());
-            }
-            Ok(None) => {
-                // No chunk at this position.
-                // world.chunks.insert(pos, UnloadedChunk::default(), ());
-            }
-            Err(e) => {
-                eprintln!("Failed to read chunk at ({}, {}): {e}", pos.x, pos.z)
-            }
-        }
+        client.score += 1
     }
 
-    (world_id, world)
+    let last_pos = *client.blocks.back().unwrap();
+    let block_pos = generate_random_block(last_pos, client.target_y);
+
+    if last_pos.y == START_POS.y {
+        client.target_y = 0
+    } else if last_pos.y < START_POS.y - 30 || last_pos.y > START_POS.y + 30 {
+        client.target_y = START_POS.y;
+    }
+
+    let mut rng = rand::thread_rng();
+
+    world
+        .chunks
+        .set_block_state(block_pos, *BLOCK_TYPES.choose(&mut rng).unwrap());
+    client.blocks.push_back(block_pos);
+
+    // Combo System
+    client.last_block_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+}
+
+fn generate_random_block(pos: BlockPos, target_y: i32) -> BlockPos {
+    let mut rng = rand::thread_rng();
+
+    // if above or below target_y, change y to gradually reach it
+    let y = match target_y {
+        0 => rng.gen_range(-1..2),
+        y if y > pos.y => 1,
+        _ => -1,
+    };
+    let z = match y {
+        1 => rng.gen_range(1..4),
+        -1 => rng.gen_range(2..6),
+        _ => rng.gen_range(1..5),
+    };
+    let x = rng.gen_range(-3..4);
+
+    BlockPos::new(pos.x + x, pos.y + y, pos.z + z)
 }
